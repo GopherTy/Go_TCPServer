@@ -1,0 +1,246 @@
+Golang 编写 Tcp 服务器
+Golang 作为广泛用于服务端和云计算领域的编程语言，tcp socket 是其中至关重要的功能。无论是 WEB 服务器还是各类中间件都离不开 tcp socket 的支持。
+
+Echo 服务器
+拆包与粘包
+优雅关闭
+与早期的每个线程持有一个 socket 的 block IO 模型不同, 多路IO复用模型使用单个线程监听多个 socket, 当某个 socket 准备好数据后再进行响应。在逻辑上与使用 select 语句监听多个 channel 的模式相同。
+
+目前主要的多路IO复用实现主要包括: SELECT, POLL 和 EPOLL。 为了提高开发效率社区也出现很多封装库， 如Netty(Java), Tornado(Python) 和 libev(C)等。
+
+Golang Runtime 封装了各操作系统平台上的多路IO复用接口， 并允许使用 goroutine 快速开发高性能的 tcp 服务器。
+
+Echo 服务器
+作为开始，我们来实现一个简单的 Echo 服务器。它会接受客户端连接并将客户端发送的内容原样传回客户端。
+
+package main
+
+import (
+    "fmt"
+    "net"
+    "io"
+    "log"
+    "bufio"
+)
+
+func ListenAndServe(address string) {
+    // 绑定监听地址
+    listener, err := net.Listen("tcp", address)
+    if err != nil {
+        log.Fatal(fmt.Sprintf("listen err: %v", err))
+    }
+    defer listener.Close()
+    log.Println(fmt.Sprintf("bind: %s, start listening...", address))
+
+    for {
+        // Accept 会一直阻塞直到有新的连接建立或者listen中断才会返回
+        conn, err := listener.Accept()
+        if err != nil {
+            // 通常是由于listener被关闭无法继续监听导致的错误
+            log.Fatal(fmt.Sprintf("accept err: %v", err))
+        }
+        // 开启新的 goroutine 处理该连接
+        go Handle(conn)
+    }
+}
+
+func Handle(conn net.Conn) {
+    // 使用 bufio 标准库提供的缓冲区功能
+    reader := bufio.NewReader(conn)
+    for {
+        // ReadString 会一直阻塞直到遇到分隔符 '\n'
+        // 遇到分隔符后会返回上次遇到分隔符或连接建立后收到的所有数据, 包括分隔符本身
+        // 若在遇到分隔符之前遇到异常, ReadString 会返回已收到的数据和错误信息
+        msg, err := reader.ReadString('\n')
+        if err != nil {
+            // 通常遇到的错误是连接中断或被关闭，用io.EOF表示
+            if err == io.EOF {
+                log.Println("connection close")
+            } else {
+                log.Println(err)
+            }
+            return
+        }
+        b := []byte(msg)
+        // 将收到的信息发送给客户端
+        conn.Write(b)
+    }
+}
+
+func main() {
+    ListenAndServe(":8000")
+}
+使用 telnet 工具测试我们编写的 Echo 服务器:
+
+$ telnet 127.0.0.1 8000
+Trying 127.0.0.1...
+Connected to 127.0.0.1.
+Escape character is '^]'.
+> a
+a
+> b
+b
+Connection closed by foreign host.
+拆包与粘包
+HTTP 等应用层协议只有收到一条完整的消息后才能进行处理，而工作在传输层的TCP协议并不了解应用层消息的结构。
+
+因此，可能遇到一条应用层消息分为两个TCP包发送或者一个TCP包中含有两条应用层消息片段的情况，前者称为拆包后者称为粘包。
+
+在 Echo 服务器的示例中，我们定义用\n表示消息结束。我们可能遇到下列几种情况:
+
+收到两个 tcp 包: "abc", "def\n", 应发出一条响应 "abcdef\n", 这是拆包的情况
+收到一个 tcp 包: "abc\ndef\n", 应发出两条响应 "abc\n", "def\n", 这是粘包的情况
+当我们使用 tcp socket 开发应用层程序时必须正确处理拆包和粘包。
+
+bufio 标准库会缓存收到的数据直到遇到分隔符才会返回，它可以正确处理拆包和粘包。
+
+上层协议通常采用下列几种思路之一来定义消息，以保证完整地进行读取:
+
+定长消息
+在消息尾部添加特殊分隔符，如示例中的Echo协议和FTP控制协议
+将消息分为header 和 body, 并在 header 提供消息总长度。这是应用最广泛的策略，如HTTP协议。
+优雅关闭
+在生产环境下需要保证TCP服务器关闭前完成必要的清理工作，包括将完成正在进行的数据传输，关闭TCP连接等。这种关闭模式称为优雅关闭，可以避免资源泄露以及客户端未收到完整数据造成异常。
+
+TCP 服务器的优雅关闭模式通常为: 先关闭listener阻止新连接进入，然后遍历所有连接逐个进行关闭。
+
+本节完整源代码地址: https://github.com/HDT3213/godis/tree/master/src/server
+
+首先修改一下TCP服务器:
+
+// handler 是应用层服务器的抽象
+type Handler interface {
+    Handle(ctx context.Context, conn net.Conn)
+    Close()error
+}
+
+func ListenAndServe(cfg *Config, handler tcp.Handler) {
+    listener, err := net.Listen("tcp", cfg.Address)
+    if err != nil {
+        logger.Fatal(fmt.Sprintf("listen err: %v", err))
+    }
+
+    // 监听中断信号
+    // atomic.AtomicBool 是作者写的封装: https://github.com/HDT3213/godis/blob/master/src/lib/sync/atomic/bool.go
+    var closing atomic.AtomicBool 
+    sigCh := make(chan os.Signal, 1)
+    signal.Notify(sigCh, syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT)
+    go func() {
+        sig := <-sigCh
+        switch sig {
+        case syscall.SIGHUP, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGINT:
+            // 收到中断信号后开始关闭流程
+            logger.Info("shuting down...")
+            // 设置标志位为关闭中, 使用原子操作保证线程可见性
+            closing.Set(true)
+            // listener 关闭后 listener.Accept() 会立即返回错误
+            listener.Close() 
+        }
+    }()
+
+
+    logger.Info(fmt.Sprintf("bind: %s, start listening...", cfg.Address))
+    // 在出现未知错误或panic后保证正常关闭
+    // 注意defer顺序，先关闭 listener 再关闭应用层服务器 handler
+    defer handler.Close()
+    defer listener.Close()
+    ctx, _ := context.WithCancel(context.Background())
+    for {
+        conn, err := listener.Accept()
+        if err != nil {
+            if closing.Get() {
+                // 收到关闭信号后进入此流程，此时listener已被监听系统信号的 goroutine 关闭
+                // handler 会被上文的 defer 语句关闭直接返回
+                return 
+            }
+            logger.Error(fmt.Sprintf("accept err: %v", err))
+            continue
+        }
+        // handle
+        logger.Info("accept link")
+        go handler.Handle(ctx, conn)
+    }
+}
+接下来修改应用层服务器:
+
+// 客户端连接的抽象
+type Client struct {
+    // tcp 连接
+    Conn net.Conn
+    // 当服务端开始发送数据时进入waiting, 阻止其它goroutine关闭连接
+    // wait.Wait是作者编写的带有最大等待时间的封装: 
+    // https://github.com/HDT3213/godis/blob/master/src/lib/sync/wait/wait.go
+    Waiting wait.Wait
+}
+
+type EchoHandler struct {
+    
+    // 保存所有工作状态client的集合(把map当set用)
+    // 需使用并发安全的容器
+    activeConn sync.Map 
+
+    // 和 tcp server 中作用相同的关闭状态标识位
+    closing atomic.AtomicBool
+}
+
+func MakeEchoHandler()(*EchoHandler) {
+    return &EchoHandler{
+    }
+}
+
+// 关闭客户端连接
+func (c *Client)Close()error {
+    // 等待数据发送完成或超时
+    c.Waiting.WaitWithTimeout(10 * time.Second)
+    c.Conn.Close()
+    return nil
+}
+
+func (h *EchoHandler)Handle(ctx context.Context, conn net.Conn) {
+    if h.closing.Get() {
+        // closing handler refuse new connection
+        conn.Close()
+    }
+
+    client := &Client {
+        Conn: conn,
+    }
+    h.activeConn.Store(client, 1)
+
+    reader := bufio.NewReader(conn)
+    for {
+        msg, err := reader.ReadString('\n')
+        if err != nil {
+            if err == io.EOF {
+                logger.Info("connection close")
+                h.activeConn.Delete(conn)
+            } else {
+                logger.Warn(err)
+            }
+            return
+        }
+        // 发送数据前先置为waiting状态
+        client.Waiting.Add(1)
+
+        // 模拟关闭时未完成发送的情况
+        //logger.Info("sleeping")
+        //time.Sleep(10 * time.Second)
+
+        b := []byte(msg)
+        conn.Write(b)
+        // 发送完毕, 结束waiting
+        client.Waiting.Done()
+    }
+}
+
+func (h *EchoHandler)Close()error {
+    logger.Info("handler shuting down...")
+    h.closing.Set(true)
+    // TODO: concurrent wait
+    h.activeConn.Range(func(key interface{}, val interface{})bool {
+        client := key.(*Client)
+        client.Close()
+        return true
+    })
+    return nil
+}
