@@ -14,6 +14,7 @@ import (
 // Session 用户的登录信息
 type Session struct {
 	Conn net.Conn
+	File *os.File
 }
 
 // 处理连接
@@ -59,12 +60,16 @@ func (s *Session) deal(m protocal.Message) (err error) {
 		// add
 		return s.add(m)
 	case protocal.HandlerDec:
-		// upload
+		// dec
 		return s.dec(m)
+		// upload
 	case protocal.HandlerUpload:
 		return s.upload(m)
 	case protocal.HandlerUploadRW:
 		return s.uploadRw(m)
+	case protocal.HandlerUploadRWOK:
+		return s.uploadRwOK(m)
+
 	default:
 		return s.cmdNotExistError()
 	}
@@ -142,76 +147,124 @@ func (s *Session) dec(m protocal.Message) (err error) {
 
 // upload 服务器上传文件操作
 func (s *Session) upload(m protocal.Message) (err error) {
+	var content string
 	data := m.GetBody()
-	var path string
-	err = json.Unmarshal(data, &path)
+	err = json.Unmarshal(data, &content)
 	if err != nil {
-		return
-	}
-	_, err = os.Create(path)
-	if err != nil {
-		if ce := logger.Logger.Check(zap.WarnLevel, "daemon deal upload err "); ce != nil {
-			ce.Write(zap.Error(err))
-		}
-		err = nil
-		msg, err := protocal.NewMessageFromJSON(protocal.HandlerFail, "create file fail ")
-		_, err = s.Conn.Write(msg.Data)
-		if err != nil {
-			return err
-		}
-	}
-
-	msg, err := protocal.NewMessageFromJSON(protocal.HandlerUpload, "ok")
-	if err != nil {
-		if ce := logger.Logger.Check(zap.WarnLevel, "daemon deal upload err "); ce != nil {
-			ce.Write(zap.Error(err))
-		}
-		err = nil
-		msg, err = protocal.NewMessageFromJSON(protocal.HandlerFail, "upload interrupt")
-		_, err = s.Conn.Write(msg.Data)
+		err = s.checkError(err, "daemon deal upload err ", "create file fail ")
 		if err != nil {
 			return
 		}
 	}
-	_, err = s.Conn.Write(msg.Data)
-	if err != nil {
-		return
-	}
-	return
+	// 判断文件是否存在
+	s.uploadFileIsExist(content)
+	return err
 }
 
 // uploadRw 进行文件创建和写入操作
 func (s *Session) uploadRw(m protocal.Message) (err error) {
+	b := make([]byte, ((protocal.BufLen-protocal.HandlerHeaderLength)-6)*3/4)
 	data := m.GetBody()
-	var b []byte
 	err = json.Unmarshal(data, &b)
 	if err != nil {
-		if ce := logger.Logger.Check(zap.WarnLevel, "deal upload create file error"); ce != nil {
-			ce.Write(zap.Error(err))
+		err = s.checkError(err, "deal upload create file error", "deal upload create file fail")
+		if err != nil {
+			return
 		}
-		err = nil
-		msg, err := protocal.NewMessageFromJSON(protocal.HandlerFail, "deal upload create file fail")
+	}
+	if err != nil {
+		fmt.Println("open error ")
+	}
+	_, err = s.File.Write(b)
+	if err != nil {
+		fmt.Println("Read error", err)
+	}
+	return
+}
+
+// uploadRwOK
+func (s *Session) uploadRwOK(m protocal.Message) (err error) {
+	err = s.File.Close()
+	if err != nil {
+		return
+	}
+	var str string
+	data := m.GetBody()
+	err = json.Unmarshal(data, &str)
+	if err != nil {
+		err = s.checkError(err, "data send over ", " daemon data send error ")
+		if err != nil {
+			return
+		}
+	}
+	msg, err := protocal.NewMessageFromJSON(protocal.HandlerUploadRWOK, str)
+	if err != nil {
+		err = s.checkError(err, "send over msg decode error", "send over msg error")
 		if err != nil {
 			return err
+		}
+	}
+	_, err = s.Conn.Write(msg.Data)
+	return
+}
+
+// checkError 用于处理指令出现错误时，服务器的错误处理
+func (s *Session) checkError(e error, decodeStr, sendStr string) (err error) {
+	if ce := logger.Logger.Check(zap.WarnLevel, decodeStr); ce != nil {
+		ce.Write(
+			zap.Error(e),
+		)
+	}
+	msg, err := protocal.NewMessageFromJSON(protocal.HandlerFail, sendStr)
+	if err != nil {
+		return
+	}
+	_, err = s.Conn.Write(msg.Data)
+	return
+}
+
+//uploadFileIsExist 判断文件是否存在
+func (s *Session) uploadFileIsExist(content string) (err error) {
+	file, err := os.OpenFile(content, os.O_RDWR|os.O_APPEND, 0666)
+	if err != nil && os.IsNotExist(err) {
+		file, err = os.Create(content)
+		if err != nil {
+			if ce := logger.Logger.Check(zap.WarnLevel, "daemon creat file error"); ce != nil {
+				ce.Write(zap.Error(err))
+			}
+		}
+		file.Close()
+		file, err = os.OpenFile(content, os.O_RDWR|os.O_APPEND, 0666)
+		if err != nil {
+			if ce := logger.Logger.Check(zap.WarnLevel, "daemon creat file error"); ce != nil {
+				ce.Write(zap.Error(err))
+			}
+		}
+		s.File = file
+		msg, err := protocal.NewMessageFromJSON(protocal.HandlerUploadRW, "ok")
+		if err != nil {
+			err = s.checkError(err, "daemon deal upload err ", "upload interrupt")
+			if err != nil {
+				return err
+			}
 		}
 		_, err = s.Conn.Write(msg.Data)
 		if err != nil {
 			return err
 		}
-	}
-
-	file, err := os.OpenFile("a.txt", 2, 0666)
-	if err != nil {
-		fmt.Println("open error ")
-	}
-	_, err = file.Write(b)
-
-	if err != nil {
-		fmt.Println("Read error", err)
-	}
-	err = file.Close()
-	if err != nil {
-		return
+	} else {
+		file.Close()
+		msg, err := protocal.NewMessageFromJSON(protocal.HandlerUploadExist, "file is exist ")
+		if err != nil {
+			err = s.checkError(err, "daemon deal upload err ", "upload interrupt")
+			if err != nil {
+				return err
+			}
+		}
+		_, err = s.Conn.Write(msg.Data)
+		if err != nil {
+			return err
+		}
 	}
 	return
 }

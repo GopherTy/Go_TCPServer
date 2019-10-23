@@ -17,6 +17,12 @@ const HandlerUpload = 100
 // HandlerUploadRW 读写文件
 const HandlerUploadRW = 101
 
+// HandlerUploadRWOK 所有数据写入完成
+const HandlerUploadRWOK = 102
+
+// HandlerUploadExist 表示该文件夹存在
+const HandlerUploadExist = 111
+
 // HandlerSuccess 服务器端成功状态码
 const HandlerSuccess = 0
 
