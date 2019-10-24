@@ -3,6 +3,7 @@ package daemon
 import (
 	"net"
 	"os"
+	"server/cmd/daemon/resource"
 	"server/configure"
 	"server/logger"
 
@@ -25,7 +26,6 @@ func Start() {
 			zap.String("addr", configure.Single().TCP.Addr),
 		)
 	}
-
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -36,9 +36,15 @@ func Start() {
 			}
 			break
 		}
-		s := Session{
-			Conn: conn,
-		}
-		go s.handConn()
+		s := NewSession(conn)
+		go handConn(s)
 	}
+}
+
+// NewSession 服务器注册 Session
+func NewSession(conn net.Conn) (s *resource.Session) {
+	s = &resource.Session{
+		Conn: conn,
+	}
+	return
 }
